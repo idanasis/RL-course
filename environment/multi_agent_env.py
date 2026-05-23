@@ -114,6 +114,9 @@ class MultiAgentBoxPushEnv(ParallelEnv):
         self.agent_positions = {}
         self.agent_dirs = {}
         self.agent_objects = {}
+        # Store goal positions from the ascii_map so they never get lost
+        # when a box is pushed onto a goal cell (overwriting the Goal object).
+        self.goal_positions = []
         
         agent_idx = 0
         colors = ["green", "red", "blue", "purple"]
@@ -124,6 +127,7 @@ class MultiAgentBoxPushEnv(ParallelEnv):
                     self.core_env.grid.set(x, y, Wall())
                 elif char == 'G':
                     self.core_env.grid.set(x, y, Goal())
+                    self.goal_positions.append((x, y))
                 elif char == 'B':
                     self.core_env.grid.set(x, y, SmallBox())
                 elif char == 'C':
@@ -151,6 +155,17 @@ class MultiAgentBoxPushEnv(ParallelEnv):
         self.core_env.agent_pos = (1, 1)
         self.core_env.agent_dir = 0
         
+    def _all_boxes_on_goals(self):
+        """
+        Return True iff every goal cell is occupied by a box (SmallBox or HeavyBox).
+        Termination should only happen when ALL goals are satisfied.
+        """
+        for gx, gy in self.goal_positions:
+            cell = self.core_env.grid.get(gx, gy)
+            if cell is None or not hasattr(cell, 'box_size'):
+                return False
+        return len(self.goal_positions) > 0
+
     def reset(self, seed=None, options=None):
         self.agents = self.possible_agents[:]
         self.steps = 0
@@ -249,10 +264,6 @@ class MultiAgentBoxPushEnv(ParallelEnv):
                         # Move all pushing agents
                         for agent, _ in pushers:
                             self.agent_positions[agent] = box_pos
-                            if n_cell is not None and n_cell.type == "goal":
-                                for a in self.agents:
-                                    rewards[a] = 1.0
-                                    terminations[a] = True
                             
                         # Clear intents for successful pushers so they don't try to move again in Pass 3
                         for agent, _ in pushers:
@@ -267,11 +278,6 @@ class MultiAgentBoxPushEnv(ParallelEnv):
             
             if fwd_cell is None or fwd_cell.can_overlap():
                 self.agent_positions[agent] = fwd_pos
-                
-                if fwd_cell is not None and fwd_cell.type == "goal":
-                    for a in self.agents:
-                        rewards[a] = 1.0
-                        terminations[a] = True
                         
             elif fwd_cell is not None and getattr(fwd_cell, "box_size", "") == "small":
                 fwd_fwd_pos = (fwd_pos[0] + vec[0], fwd_pos[1] + vec[1])
@@ -280,6 +286,12 @@ class MultiAgentBoxPushEnv(ParallelEnv):
                     self.core_env.grid.set(*fwd_fwd_pos, fwd_cell)
                     self.core_env.grid.set(*fwd_pos, None)
                     self.agent_positions[agent] = fwd_pos
+
+        # Check if all boxes are on goal positions → terminate with reward
+        if self._all_boxes_on_goals():
+            for a in self.agents:
+                rewards[a] = 1.0
+                terminations[a] = True
 
         if self.steps >= self.max_steps:
             for a in self.agents:

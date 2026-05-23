@@ -111,9 +111,6 @@ class StochasticMultiAgentBoxPushEnv(MultiAgentBoxPushEnv):
                             self.core_env.grid.set(nx, ny, box_obj)
                             for agent, _ in pushers:
                                 self.agent_positions[agent] = box_pos
-                            
-                            # FIX 1: Removed immediate heavy-box goal termination here!
-                            
                         # push fails → agents stay, world unchanged
 
                 # Either way, these agents' intents are consumed
@@ -140,8 +137,7 @@ class StochasticMultiAgentBoxPushEnv(MultiAgentBoxPushEnv):
                         self.core_env.grid.set(*fwd_fwd_pos, fwd_cell)
                         self.core_env.grid.set(*fwd_pos, None)
                         self.agent_positions[agent] = fwd_pos
-                        
-                        # FIX 2: Removed immediate small-box goal termination here!
+                    # push fails → agent stays, world unchanged
 
             elif fwd_cell is None or fwd_cell.can_overlap():
                 # ── MOVE ─────────────────────────────────────────────
@@ -152,25 +148,12 @@ class StochasticMultiAgentBoxPushEnv(MultiAgentBoxPushEnv):
 
                 if actual_fwd_cell is None or actual_fwd_cell.can_overlap():
                     self.agent_positions[agent] = actual_fwd_pos
-                    
-                    # FIX 3: Removed immediate agent-on-goal termination here!
+                # else: deviated into obstacle → agent stays, no error
 
-        # ── Global Win Check ──────────────────────────────────────────
-        # Fix 1, 2 & 3 replacement: Check if ALL goals are covered by boxes
-        goal_positions = []
-        for y, row in enumerate(self.ascii_map):
-            for x, char in enumerate(row):
-                if char == 'G':
-                    goal_positions.append((x, y))
-        
-        boxes_on_goals = 0
-        for gx, gy in goal_positions:
-            cell = self.core_env.grid.get(gx, gy)
-            if cell is not None and getattr(cell, "type", "") == "box":
-                boxes_on_goals += 1
-                
-        # Only terminate if ALL goals have a box on them
-        if len(goal_positions) > 0 and boxes_on_goals == len(goal_positions):
+            # else: intended cell is a wall / other obstacle → no-op
+
+        # ── Check if all boxes are on goal positions → terminate ──────
+        if self._all_boxes_on_goals():
             self._apply_goal_termination(rewards, terminations)
 
         # ── Truncation check ──────────────────────────────────────────
