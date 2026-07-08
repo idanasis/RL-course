@@ -1,7 +1,7 @@
 from minigrid.core.grid import Grid
 from minigrid.minigrid_env import MiniGridEnv
 from minigrid.core.world_object import Wall, Goal
-from environment.objects import SmallBox, BigBox
+from environment.objects import SmallBox, HeavyBox
 import numpy as np
 
 class BoxPushEnv(MiniGridEnv):
@@ -39,6 +39,8 @@ class BoxPushEnv(MiniGridEnv):
     def _gen_grid(self, width, height):
         self.grid = Grid(width, height)
         self.agent_start_positions = []
+        # Store goal positions from the ascii_map so they persist
+        self.goal_positions = []
         
         for y, row in enumerate(self.ascii_map):
             for x, char in enumerate(row):
@@ -46,10 +48,11 @@ class BoxPushEnv(MiniGridEnv):
                     self.grid.set(x, y, Wall())
                 elif char == 'G':
                     self.grid.set(x, y, Goal())
+                    self.goal_positions.append((x, y))
                 elif char == 'B':
                     self.grid.set(x, y, SmallBox())
                 elif char == 'C':
-                    self.grid.set(x, y, BigBox())
+                    self.grid.set(x, y, HeavyBox())
                 elif char == 'A':
                     self.agent_start_positions.append((x, y))
                     
@@ -63,6 +66,16 @@ class BoxPushEnv(MiniGridEnv):
             self.agent_dir = 0
             
         self.mission = "Push the boxes to the goal."
+
+    def _all_boxes_on_goals(self):
+        """
+        Return True iff every goal cell is occupied by a box (SmallBox or HeavyBox).
+        """
+        for gx, gy in self.goal_positions:
+            cell = self.grid.get(gx, gy)
+            if cell is None or not hasattr(cell, 'box_size'):
+                return False
+        return len(self.goal_positions) > 0
 
     def reset(self, *, seed=None, options=None):
         obs, info = super().reset(seed=seed)
@@ -96,9 +109,6 @@ class BoxPushEnv(MiniGridEnv):
         elif action == self.actions.forward:
             if fwd_cell is None or fwd_cell.can_overlap():
                 self.agent_pos = tuple(fwd_pos)
-                if fwd_cell is not None and fwd_cell.type == "goal":
-                    terminated = True
-                    reward = self._reward()
                     
             elif fwd_cell is not None and fwd_cell.type == "box" and getattr(fwd_cell, "box_size", "") == "small":
                 # Check what is behind the box
@@ -112,6 +122,11 @@ class BoxPushEnv(MiniGridEnv):
                     self.grid.set(*fwd_pos, None)
                     # Move the agent into the space the box was occupying
                     self.agent_pos = tuple(fwd_pos)
+
+        # Check if all boxes are on goal positions
+        if self._all_boxes_on_goals():
+            terminated = True
+            reward = self._reward()
                     
         if self.step_count >= self.max_steps:
             truncated = True

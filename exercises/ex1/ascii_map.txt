@@ -1,0 +1,8 @@
+[
+    "WWWWWW",
+    "WA   W",
+    "WBBACW",
+    "W    W",
+    "WGG GW",
+    "WWWWWW"
+]
