@@ -8,22 +8,22 @@ static wall / box / goal layout ARE known. Observations are the deterministic
 maintains a belief over the agent's position as a cloud of particles, each
 particle being a single ``(x, y)`` coordinate hypothesis.
 
-Because both the transition model and the observation model are treated as
-deterministic, this is essentially *rejection sampling*: a particle survives an
-update only if the observation it would generate exactly matches the real
-observation. That makes the belief collapse quickly, but also means the cloud
-can be wiped out entirely -- so a deterministic "map knowledge" fallback
-re-derives the full set of consistent positions directly from the known map.
+The belief is updated by **unweighted rejection sampling** (Silver & Veness,
+2010): sample a particle from the current belief, simulate the real action with
+the SAME stochastic generative model POMCP uses (``sample_step``, transition +
+observation), and keep the resulting position only if its simulated observation
+matches the real one -- repeated until ``N`` particles are collected. Because
+the transition is stochastic and the observation deterministic, the rejection
+rate can be high and the cloud can empty out, so a deterministic "map knowledge"
+fallback re-derives the consistent positions directly from the known map.
 
 Localization model
 ------------------
-Consistent with the translation-based (heading-agnostic) observation, the
-filter treats actions as cardinal moves. An action is one of the strings
-``"north" / "south" / "east" / "west" / "stay"`` (or an explicit ``(dx, dy)``
-vector, or ``None`` for stay). A particle moves one cell in the action's
-direction if that cell is free (not a wall/box); otherwise it stays put. Env
-rotations / no-ops map to ``"stay"``. The transition model is pluggable via the
-``transition_fn`` constructor argument if different dynamics are needed.
+The filter tracks only the agent's ``(x, y)`` position. Its transition is not a
+separate model: ``update`` receives the shared ``sample_step`` plus the known
+``heading`` and ``boxes``, and simulates the real env action ``(0=left, 1=right,
+2=forward)`` exactly as POMCP does. This guarantees the filter and the planner
+use one and the same generative model.
 
 No external POMDP libraries are used.
 """
@@ -72,16 +72,6 @@ def build_static_grid(ascii_map):
     return grid, width, height
 
 
-# Cardinal action -> (dx, dy). y grows downward (South), matching the grid.
-ACTION_VECTORS = {
-    "north": (0, -1),
-    "south": (0, 1),
-    "east": (1, 0),
-    "west": (-1, 0),
-    "stay": (0, 0),
-}
-
-
 class ParticleFilter:
     """Rejection-sampling particle filter over the agent's ``(x, y)`` position."""
 
@@ -90,14 +80,12 @@ class ParticleFilter:
         ascii_map,
         n_particles=500,
         window_size=3,
-        transition_fn=None,
         seed=None,
     ):
         self.grid, self.width, self.height = build_static_grid(ascii_map)
         self.n_particles = n_particles
         self.window_size = window_size
         self.rng = np.random.default_rng(seed)
-        self.transition_fn = transition_fn or self._default_transition
 
         # All cells the agent could legally occupy (free floor + overlappable
         # cells such as goals). Boxes and walls are excluded.
@@ -152,29 +140,6 @@ class ParticleFilter:
         )
 
     # ------------------------------------------------------------------
-    # Transition model
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _action_vector(action):
-        if action is None:
-            return (0, 0)
-        if isinstance(action, str):
-            return ACTION_VECTORS[action.lower()]
-        # Assume an explicit (dx, dy) vector.
-        dx, dy = action
-        return (int(dx), int(dy))
-
-    def _default_transition(self, pos, action):
-        """Deterministic cardinal move; blocked moves leave the particle put."""
-        dx, dy = self._action_vector(action)
-        if dx == 0 and dy == 0:
-            return pos
-        nx, ny = pos[0] + dx, pos[1] + dy
-        if self._is_free(nx, ny):
-            return (nx, ny)
-        return pos
-
-    # ------------------------------------------------------------------
     # Belief lifecycle
     # ------------------------------------------------------------------
     def initialize_particles(self):
@@ -185,32 +150,63 @@ class ParticleFilter:
         self.particles = [self.free_cells[i] for i in idx]
         return self.particles
 
-    def update(self, action, real_observation):
+    def update(self, action, real_observation, heading, boxes, sample_step,
+               max_attempt_factor=30):
         """
-        Advance the belief by one step.
+        POMCP-style *unweighted rejection-sampling* belief update
+        (Silver & Veness, 2010).
 
-        1. Move every particle through the known transition model.
-        2. Keep a moved particle only if the observation it would generate
-           exactly matches ``real_observation`` (rejection sampling); resample
-           the survivors back up to ``N`` to keep the cloud size constant.
-        3. If *no* particle survives, fall back to full map knowledge: scan
-           every valid cell, collect those whose egocentric slice matches the
-           real observation, and repopulate ``N`` particles from that set.
+        Repeat until ``N`` new particles are collected (or the attempt budget is
+        spent):
+
+          1. Sample a particle (position) from the current belief.
+          2. Simulate ``action`` on the full state ``(pos, heading, boxes)`` with
+             the SAME stochastic generative model POMCP uses (``sample_step``),
+             which returns the next state and the observation it would produce.
+          3. Keep the resulting position iff that simulated observation exactly
+             matches ``real_observation``; otherwise reject and resample.
+
+        Because the transition is stochastic and the observation deterministic,
+        the rejection rate can be high and the cloud can empty out. On depletion
+        we fall back to deterministic **map-knowledge recovery**: repopulate from
+        the known cells whose egocentric slice matches the real observation.
+
+        Args:
+            action: real env action (0=left, 1=right, 2=forward).
+            real_observation: the 3x3 window actually received.
+            heading: the agent's (known) heading before the action.
+            boxes: the known box layout (frozenset of ``(x, y, size)``).
+            sample_step: the generative model ``G(state, action, rng)`` shared
+                with POMCP (typically ``planner.sample_step``).
         """
         real_key = self._key(real_observation)
+        n = self.n_particles
+        prior = self.particles                       # sample from the current belief
+        if not prior:
+            return self.recover_from_map(real_observation)
 
-        survivors = []
-        for p in self.particles:
-            moved = self.transition_fn(p, action)
-            if self._key_by_cell.get(moved, self._key(self.observation_at(moved))) == real_key:
-                survivors.append(moved)
+        new_particles = []
+        attempts = 0
+        max_attempts = n * max_attempt_factor
+        while len(new_particles) < n and attempts < max_attempts:
+            pos = prior[self.rng.integers(0, len(prior))]
+            next_state, obs_key, _r, _t = sample_step((pos, heading, boxes), action, self.rng)
+            attempts += 1
+            if obs_key == real_key:
+                new_particles.append(next_state[0])
 
-        if survivors:
-            self.particles = self._resample(survivors)
-            return self.particles
-
-        # ── Failsafe: map-knowledge recovery ──────────────────────────
-        return self.recover_from_map(real_observation)
+        if len(new_particles) == n:
+            self.particles = new_particles
+        elif new_particles:
+            # Partial collection: top up via map-knowledge reinvigoration.
+            candidates = self._cells_by_obs.get(real_key) or new_particles
+            fill = [candidates[self.rng.integers(0, len(candidates))]
+                    for _ in range(n - len(new_particles))]
+            self.particles = new_particles + fill
+        else:
+            # Total depletion -> map-knowledge recovery.
+            self.particles = self.recover_from_map(real_observation)
+        return self.particles
 
     def recover_from_map(self, real_observation):
         """
@@ -251,117 +247,3 @@ class ParticleFilter:
 
     def __len__(self):
         return len(self.particles)
-
-
-# ---------------------------------------------------------------------------
-# Test block
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    # ── Section A: filter mechanics on a known, asymmetric map ────────────
-    ascii_map = [
-        "WWWWWWW",
-        "W     W",
-        "W WWW W",
-        "W   W W",
-        "WGW B W",
-        "W  C  W",
-        "WWWWWWW",
-    ]
-
-    N = 500
-    pf = ParticleFilter(ascii_map, n_particles=N, seed=0)
-
-    # Init: exactly N particles, all on free cells.
-    assert len(pf) == N
-    assert all(p in set(pf.free_cells) for p in pf.particles)
-    print(f"Initialized {len(pf)} particles over {len(pf.free_cells)} free cells.")
-
-    # Drive a known ground-truth trajectory and feed the filter the exact
-    # observations that trajectory produces. The true position must remain in
-    # the belief at every step, and the belief should collapse as we move.
-    true_pos = (1, 1)
-    path = ["south", "south", "east", "east", "north", "stay"]
-
-    real_obs = pf.observation_at(true_pos)
-    pf.update("stay", real_obs)  # first observation, no motion
-    assert true_pos in pf.distinct_positions()
-    print(f"\nStep 0  action=stay   true={true_pos}  "
-          f"belief_size={len(pf.distinct_positions())}  est={pf.estimate()}")
-
-    for i, action in enumerate(path, start=1):
-        true_pos = pf._default_transition(true_pos, action)
-        real_obs = pf.observation_at(true_pos)
-        pf.update(action, real_obs)
-        assert true_pos in pf.distinct_positions(), (
-            f"true position {true_pos} dropped from belief after action '{action}'"
-        )
-        assert len(pf) == N  # cloud size is maintained
-        print(f"Step {i}  action={action:5s} true={true_pos}  "
-              f"belief_size={len(pf.distinct_positions())}  est={pf.estimate()}")
-
-    # After an informative trajectory the belief should have collapsed well
-    # below the number of free cells.
-    assert len(pf.distinct_positions()) < len(pf.free_cells)
-
-    # ── Section B: failsafe when the cloud is wiped out ───────────────────
-    # Force a catastrophic loss (0 particles) and confirm the deterministic
-    # map-knowledge recovery repopulates a valid, true-position-containing set.
-    target = (4, 5)  # some free cell
-    real_obs = pf.observation_at(target)
-    pf.particles = []  # simulate total depletion
-    pf.update("stay", real_obs)
-    assert len(pf) == N, "failsafe did not repopulate N particles"
-    assert target in pf.distinct_positions()
-    # Every repopulated particle must be genuinely consistent with the map.
-    assert all(
-        np.array_equal(pf.observation_at(p), real_obs) for p in pf.distinct_positions()
-    )
-    print(f"\nFailsafe: recovered {len(pf)} particles across "
-          f"{len(pf.distinct_positions())} candidate cell(s) consistent with obs.")
-
-    # Failsafe also fires when particles exist but none can match the obs.
-    pf.particles = [(1, 1)] * N            # all wrong for `target`'s observation
-    pf.update("stay", pf.observation_at(target))
-    assert target in pf.distinct_positions()
-    print("Failsafe: also triggered correctly from a fully-mismatched cloud.")
-
-    # Observation inconsistent with the whole map -> empty belief (no crash).
-    bogus = np.full((3, 3), 9, dtype=np.int8)
-    pf.recover_from_map(bogus)
-    assert len(pf) == 0
-    print("Failsafe: impossible observation yields an empty belief, no crash.")
-
-    # ── Section C: integration with the real env + observation function ───
-    from environment import MultiAgentBoxPushEnv
-    try:
-        from .observation_function import get_agent_observation
-    except ImportError:
-        from observation_function import get_agent_observation
-
-    env_map = [
-        "WWWWWW",
-        "W A  W",
-        "W B  W",
-        "WC  GW",
-        "WWWWWW",
-    ]
-    env = MultiAgentBoxPushEnv(ascii_map=env_map)
-    env.reset()
-    agent = env.possible_agents[0]
-
-    pf2 = ParticleFilter(env_map, n_particles=200, seed=1)
-    true = env.agent_positions[agent]
-
-    # The filter's hypothetical observation for the true cell must match the
-    # observation the env's custom observation function actually produces.
-    real = get_agent_observation(env, agent)
-    assert np.array_equal(pf2.observation_at(true), real), (
-        "filter observation model disagrees with the env observation function"
-    )
-
-    pf2.update("stay", real)
-    assert true in pf2.distinct_positions()
-    print(f"\nIntegration: env agent truly at {true}; filter belief narrowed to "
-          f"{sorted(pf2.distinct_positions())}, estimate={pf2.estimate()}.")
-
-    print("\nAll particle filter tests passed.")

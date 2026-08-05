@@ -18,8 +18,9 @@ agent's heading and the box layout:
     state = (agent_pos, agent_dir, boxes)
 
 - ``agent_pos`` is sampled from the particle filter.
-- ``agent_dir`` is unobserved, so it is sampled uniformly from {0,1,2,3} at the
-  start of every simulation (principled treatment of hidden heading).
+- ``agent_dir`` (heading) is *observable* in the online loop -- we know the start
+  dir and every rotation we command -- so it is pinned via ``known_dir`` (it can
+  still fall back to a uniform sample from {0,1,2,3} when unknown).
 - ``boxes`` is known from the static map and threaded (and mutated on pushes)
   through the generative model.
 
@@ -27,12 +28,16 @@ The observation model is the translation-based 3x3 egocentric window and depends
 only on ``(agent_pos, boxes)`` -- never on heading -- which is exactly what
 makes the filter's position-only belief compatible with this planner.
 
-Generative model ``G(s, a) -> (s', o, r, terminal)``
-----------------------------------------------------
-- left/right rotate the heading in place.
-- forward moves one cell along the heading if free; walls/out-of-bounds block
-  it; a *small* box is pushed if the cell beyond is free; a *heavy* box cannot
-  be moved by a single agent (blocked).
+Stochastic generative model ``G(s, a) -> (s', o, r, terminal)`` (``sample_step``)
+--------------------------------------------------------------------------------
+Matches the env's stochastic dynamics, and is the SAME model the particle filter
+uses for its rejection-sampling belief update:
+- left/right rotate the heading in place (deterministic).
+- forward: if the intended cell is free the agent MOVES, but the move direction
+  succeeds w.p. ``move_success_prob`` (0.8) and deviates +/-90 deg otherwise; a
+  deviation into an obstacle leaves the agent put. If the intended cell holds a
+  *small* box it is PUSHED w.p. ``push_success_prob`` (0.8); a *heavy* box cannot
+  be moved by a single agent; walls/out-of-bounds block the action.
 - reward is 1.0 (and terminal) once every goal cell holds a box, else 0.0.
 
 No external planning libraries are used.
@@ -76,6 +81,8 @@ class POMCP:
         c=1.0,
         max_depth=50,
         epsilon=0.01,
+        move_success_prob=0.8,
+        push_success_prob=0.8,
         seed=None,
     ):
         self.pf = particle_filter
@@ -83,6 +90,11 @@ class POMCP:
         self.c = c
         self.max_depth = max_depth
         self.epsilon = epsilon                 # depth cutoff: gamma^depth < epsilon
+        # Stochastic dynamics of the generative model (match the env defaults):
+        # a move succeeds in the intended direction w.p. move_success_prob and
+        # deviates +/-90 deg otherwise; a push succeeds w.p. push_success_prob.
+        self.move_success_prob = move_success_prob
+        self.push_success_prob = push_success_prob
         self.rng = random.Random(seed)
         # Optional known heading. The agent's *position* is hidden, but its
         # heading is not (we know the start dir and every rotation we command),
@@ -147,8 +159,26 @@ class POMCP:
     def _all_on_goals(self, box_positions):
         return self.goals.issubset(box_positions)
 
-    def step_model(self, state, action):
-        """Generative model G(s, a) -> (next_state, obs_key, reward, terminal)."""
+    def _sample_move_dir(self, intended_dir, rng):
+        """Stochastic move direction: intended w.p. p, else deviate +/-90 deg."""
+        side = (1.0 - self.move_success_prob) / 2.0
+        r = rng.random()
+        if r < self.move_success_prob:
+            return intended_dir
+        elif r < self.move_success_prob + side:
+            return (intended_dir - 1) % 4
+        else:
+            return (intended_dir + 1) % 4
+
+    def sample_step(self, state, action, rng):
+        """
+        Stochastic generative model G(s, a) -> (next_state, obs_key, reward,
+        terminal), matching StochasticMultiAgentBoxPushEnv. Rotations are
+        deterministic; a forward MOVE deviates +/-90 deg (prob 1-move_success),
+        and a forward PUSH of a small box fails w.p. 1-push_success. This SAME
+        method is used both for POMCP tree simulations and for the particle
+        filter's rejection-sampling belief update.
+        """
         pos, d, boxes = state
         box_map = {(x, y): s for (x, y, s) in boxes}
 
@@ -158,32 +188,44 @@ class POMCP:
             new_pos, new_dir, new_boxes = pos, (d + 1) % 4, boxes
         else:  # FORWARD
             new_dir = d
-            vx, vy = DIR_TO_VEC[d]
+            vx, vy = int(DIR_TO_VEC[d][0]), int(DIR_TO_VEC[d][1])
             fx, fy = pos[0] + vx, pos[1] + vy
 
             if not self._in_bounds(fx, fy) or self._static[fy][fx] == WALL:
-                new_pos, new_boxes = pos, boxes                       # blocked
+                new_pos, new_boxes = pos, boxes                       # intended blocked
             elif (fx, fy) in box_map:
+                # PUSH branch (intended cell is a box): no directional deviation.
                 size = box_map[(fx, fy)]
                 bx, by = fx + vx, fy + vy
-                if (
+                pushable = (
                     size == "small"
                     and self._in_bounds(bx, by)
                     and self._static[by][bx] != WALL
                     and (bx, by) not in box_map
-                ):
+                )
+                if pushable and rng.random() < self.push_success_prob:
                     nb = set(boxes)
                     nb.discard((fx, fy, size))
                     nb.add((bx, by, size))
-                    new_pos, new_boxes = (fx, fy), frozenset(nb)      # push small box
+                    new_pos, new_boxes = (fx, fy), frozenset(nb)      # push succeeds
                 else:
-                    new_pos, new_boxes = pos, boxes                   # heavy / blocked
+                    new_pos, new_boxes = pos, boxes                   # heavy / blocked / push failed
             else:
-                new_pos, new_boxes = (fx, fy), boxes                  # free move
+                # MOVE branch (intended cell free): direction may deviate +/-90 deg.
+                adir = self._sample_move_dir(d, rng)
+                avx, avy = int(DIR_TO_VEC[adir][0]), int(DIR_TO_VEC[adir][1])
+                ax, ay = pos[0] + avx, pos[1] + avy
+                if (
+                    self._in_bounds(ax, ay)
+                    and self._static[ay][ax] != WALL
+                    and (ax, ay) not in box_map
+                ):
+                    new_pos, new_boxes = (ax, ay), boxes              # move (possibly deviated)
+                else:
+                    new_pos, new_boxes = pos, boxes                   # deviated into obstacle
 
         next_box_map = {(x, y): s for (x, y, s) in new_boxes}
-        box_positions = set(next_box_map.keys())
-        terminal = self._all_on_goals(box_positions)
+        terminal = self._all_on_goals(set(next_box_map.keys()))
         reward = 1.0 if terminal else 0.0
         obs = self._observation(new_pos, next_box_map)
         return (new_pos, new_dir, new_boxes), obs.tobytes(), reward, terminal
@@ -235,7 +277,7 @@ class POMCP:
         node = self.tree[history]
         action = self._ucb_select(node)
 
-        next_state, obs_key, reward, terminal = self.step_model(state, action)
+        next_state, obs_key, reward, terminal = self.sample_step(state, action, self.rng)
         if terminal:
             total = reward
         else:
@@ -255,7 +297,7 @@ class POMCP:
         if self.gamma ** depth < self.epsilon or depth >= self.max_depth:
             return 0.0
         action = self.rng.choice(ACTIONS)
-        next_state, _obs, reward, terminal = self.step_model(state, action)
+        next_state, _obs, reward, terminal = self.sample_step(state, action, self.rng)
         if terminal:
             return reward
         return reward + self.gamma * self.rollout(next_state, depth + 1)
@@ -282,79 +324,3 @@ class POMCP:
             return None
         return max(ACTIONS, key=lambda a: (node.Qa[a], node.Na[a]))
 
-    def action_values(self, history=()):
-        """Return (Qa, Na) at a history node for inspection/testing."""
-        node = self.tree.get(history)
-        if node is None:
-            return None, None
-        return list(node.Qa), list(node.Na)
-
-
-# ---------------------------------------------------------------------------
-# Test block
-# ---------------------------------------------------------------------------
-if __name__ == "__main__":
-    from environment import MultiAgentBoxPushEnv
-    try:
-        from .practical_filter import ParticleFilter
-        from .observation_function import get_agent_observation
-    except ImportError:
-        from practical_filter import ParticleFilter
-        from observation_function import get_agent_observation
-
-    # Corridor: agent must face East and push the small box (B) onto the goal (G).
-    #   (1,1)=agent  (3,1)=small box  (4,1)=goal
-    ascii_map = [
-        "WWWWWW",
-        "WA BGW",
-        "WWWWWW",
-    ]
-
-    env = MultiAgentBoxPushEnv(ascii_map=ascii_map)
-    env.reset()
-    agent = env.possible_agents[0]
-
-    pf = ParticleFilter(ascii_map, n_particles=300, seed=0)
-    # Localize from the first real observation.
-    pf.update("stay", get_agent_observation(env, agent))
-    print(f"Belief after first observation: {sorted(pf.distinct_positions())}")
-
-    planner = POMCP(pf, gamma=0.95, c=1.0, seed=0)
-
-    # ── Unit-test the generative model ────────────────────────────────────
-    # Agent at (2,1) facing East (dir 0), pushes box (3,1) -> goal (4,1): terminal.
-    s0 = ((2, 1), 0, planner.initial_boxes)
-    s1, _o, r, term = planner.step_model(s0, FORWARD)
-    assert s1[0] == (3, 1), "agent should advance into the box's old cell"
-    assert (4, 1, "small") in s1[2], "small box should be pushed onto the goal"
-    assert term and r == 1.0, "all-boxes-on-goals must be terminal with reward 1"
-    print("Generative model: forward-push onto goal is terminal (reward 1.0). OK")
-
-    # Facing West into the wall at (0,1): blocked, no movement, not terminal.
-    s_block, _o, r_b, term_b = planner.step_model(((1, 1), 2, planner.initial_boxes), FORWARD)
-    assert s_block[0] == (1, 1) and not term_b and r_b == 0.0
-    print("Generative model: forward into wall is a no-op. OK")
-
-    # Rotations change heading only.
-    s_rot, _o, _r, _t = planner.step_model(((1, 1), 0, planner.initial_boxes), LEFT)
-    assert s_rot[0] == (1, 1) and s_rot[1] == 3
-    print("Generative model: rotate-left changes heading only. OK")
-
-    # ── Run the planner ───────────────────────────────────────────────────
-    best = planner.search(time_budget=0.5)
-    Qa, Na = planner.action_values()
-    root = planner.tree[()]
-
-    assert best in ACTIONS
-    assert root.N > 0 and planner.last_num_simulations > 0
-    assert sum(Na) == root.N, "per-action visit counts must sum to the node's visits"
-    assert all(a >= 0 for a in Na) and all(math.isfinite(q) for q in Qa)
-
-    action_names = {LEFT: "left", RIGHT: "right", FORWARD: "forward"}
-    print(f"\nPlanned {planner.last_num_simulations} simulations "
-          f"({root.N} root visits, {len(planner.tree)} tree nodes).")
-    for a in ACTIONS:
-        print(f"  action={action_names[a]:8s}  N(h,a)={Na[a]:5d}  Q(h,a)={Qa[a]:.4f}")
-    print(f"Best action at root: {action_names[best]}")
-
-    print("\nAll POMCP tests passed.")

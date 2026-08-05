@@ -11,35 +11,36 @@ This ties the four ex4 pieces together:
 and runs the standard online-planning loop:
 
     plan an action with POMCP  ->  execute it in the env  ->  read the real
-    observation  ->  ParticleFilter.update(action, observation)  ->  repeat.
+    observation  ->  ParticleFilter.update(...)  ->  repeat.
 
 Integration notes
 ------------------
-* Only the agent's *position* is hidden. Its *heading* is not: we know the
+* One shared generative model. Both POMCP (tree simulations) and the particle
+  filter (rejection-sampling belief update) call the SAME stochastic
+  ``planner.sample_step`` -- the env's dynamics (move 0.8 / +-90 deg, push 0.8).
+
+* Only the agent's *position* is hidden. Its *heading* is observable: we know the
   start heading (``env.agent_dirs``) and every rotation we command, so the loop
-  tracks the heading exactly and (a) feeds it to POMCP via ``known_dir`` and
-  (b) uses it to translate a "forward" action into the cardinal move vector the
-  position-only particle filter needs. Rotations are "stay" moves for the
-  filter (position unchanged).
+  tracks it exactly and feeds it to both POMCP (``known_dir``) and the filter's
+  transition. This keeps the hidden state = position, as the assignment defines.
 
-* The particle filter's transition model is deterministic while the env is
-  stochastic, but that is fine: observations are deterministic and highly
-  informative, so mispredicted particles are rejected and the map-knowledge
-  fallback re-derives the consistent positions. The observation always drives
-  localization.
-
-* The filter's map treats boxes as static. In the single-box-onto-goal tasks
-  used here a box only ever moves on the terminal push (which ends the episode),
-  so the filter's map stays valid throughout the localization-relevant portion.
+* Action space is the real env's rotation-based ``{0: left, 1: right, 2:
+  forward}``. (The assignment text describes direct cardinal moves, but the
+  provided environment is rotation-based; we follow the actual environment.)
 
 * POMCP's search tree is history-indexed and belief-specific, so it is cleared
-  before every planning step (fresh search from the current belief).
+  before every planning step (a fresh search from the current belief).
+
+* Multi-agent: each robot runs its own filter + POMCP (decentralized). They act
+  simultaneously; each localizes from its own observation. The single-agent
+  generative model does not model the other robot, so this is an approximation
+  (fine for the one-box task here; tight coordination such as the heavy box is
+  out of reach for independent planners).
 """
 
 import argparse
 
 import numpy as np
-from minigrid.core.constants import DIR_TO_VEC
 
 from environment import StochasticMultiAgentBoxPushEnv
 
@@ -53,84 +54,80 @@ except ImportError:  # pragma: no cover - fallback for direct-script execution
     from pomcp import POMCP, LEFT, RIGHT, FORWARD
 
 
-# Single-agent room. The agent (A, start (1,1), heading South) must navigate the
-# walled path -- down the left column, then right along the bottom -- to reach
-# cell (3,5), from which pushing East drives the small box (B, (4,5)) one cell
-# onto the goal (G, (5,5)). The reward is sparse (only the terminal push pays
-# off) and the horizon is ~8 actions, so the planning time budget matters. The
-# box moves only on that terminal push, so the filter's static-box map stays
-# valid, and the internal walls give every cell a distinct enough observation
-# for drift-free localization.
-EVAL_MAP = [
+# Open room, box (B) sits one cell above the goal (G) so a single South push
+# solves it. Both scenarios share this layout; only the number of agents differs,
+# giving a controlled single-vs-multi comparison.
+#   single: agent at (1,1); multi: agents at (1,1) and (5,1). Box (3,4), goal (3,5).
+SINGLE_MAP = [
     "WWWWWWW",
     "WA    W",
-    "W WWW W",
-    "W W   W",
-    "W W W W",
-    "W   BGW",
+    "W     W",
+    "W     W",
+    "W  B  W",
+    "W  G  W",
+    "WWWWWWW",
+]
+
+MULTI_MAP = [
+    "WWWWWWW",
+    "WA   AW",
+    "W     W",
+    "W     W",
+    "W  B  W",
+    "W  G  W",
     "WWWWWWW",
 ]
 
 ACTION_NAMES = {LEFT: "left", RIGHT: "right", FORWARD: "forward"}
 
 
-def filter_move_and_heading(action, heading):
-    """
-    Translate a real env action + current heading into (filter_move, new_heading).
-
-    The filter tracks position only, so:
-      * forward -> the cardinal (dx, dy) vector of the current heading,
-      * left/right -> "stay" (position unchanged) while the heading rotates.
-    """
-    if action == FORWARD:
-        vx, vy = DIR_TO_VEC[heading]
-        return (int(vx), int(vy)), heading
+def next_heading(action, heading):
+    """Deterministic heading after a rotation; forward leaves it unchanged."""
     if action == LEFT:
-        return "stay", (heading - 1) % 4
-    # RIGHT
-    return "stay", (heading + 1) % 4
+        return (heading - 1) % 4
+    if action == RIGHT:
+        return (heading + 1) % 4
+    return heading
 
 
-def run_episode(ascii_map, time_budget, seed, max_steps=50, n_particles=300, verbose=False):
-    """
-    Run one online-planning episode. Returns ``(steps, reached_goal)``.
-    """
-    # Seed the global numpy RNG that drives the env's stochastic transitions,
-    # plus the filter/planner RNGs, so episodes are independent & reproducible.
-    np.random.seed(seed)
+def _make_agent(ascii_map, n_particles, seed):
+    """Build a (filter, planner) pair for one agent."""
+    pf = ParticleFilter(ascii_map, n_particles=n_particles, seed=seed)
+    planner = POMCP(pf, gamma=0.95, c=1.0, seed=seed)
+    return pf, planner
 
+
+def _localize_initial(pf, env, agent):
+    """Filter the uniform prior by the first real observation."""
+    pf.recover_from_map(get_agent_observation(env, agent))
+    if not pf.particles:
+        pf.initialize_particles()
+
+
+def run_episode(ascii_map, time_budget, seed, max_steps=50, n_particles=500, verbose=False):
+    """One single-agent online-planning episode. Returns ``(steps, reached_goal)``."""
+    np.random.seed(seed)  # controls the env's stochastic transitions
     env = StochasticMultiAgentBoxPushEnv(ascii_map=ascii_map, max_steps=max_steps)
     env.reset(seed=seed)
     agent = env.possible_agents[0]
 
-    pf = ParticleFilter(ascii_map, n_particles=n_particles, seed=seed)
-    planner = POMCP(pf, gamma=0.95, c=1.0, seed=seed)
+    pf, planner = _make_agent(ascii_map, n_particles, seed)
+    boxes = planner.initial_boxes
+    heading = env.agent_dirs[agent]            # heading is known (only position is hidden)
+    _localize_initial(pf, env, agent)
 
-    # Heading is known (only position is hidden); track it exactly.
-    heading = env.agent_dirs[agent]
-
-    # Localize from the very first real observation before planning.
-    pf.update("stay", get_agent_observation(env, agent))
-
-    steps = 0
-    reached_goal = False
+    steps, reached_goal = 0, False
     while env.agents:
-        # Fresh tree each step: the belief (and thus the root) has changed.
-        planner.tree.clear()
+        planner.tree.clear()                   # fresh search from the current belief
         action = planner.search(time_budget, known_dir=heading)
 
-        # Execute in the real environment.
-        _obs, _rewards, terminations, truncations, _infos = env.step({agent: action})
+        _obs, _r, terminations, truncations, _i = env.step({agent: action})
         steps += 1
-
-        move, heading = filter_move_and_heading(action, heading)
+        pre_heading, heading = heading, next_heading(action, heading)
 
         if verbose:
-            print(
-                f"  step {steps:2d}: belief={sorted(pf.distinct_positions())} "
-                f"action={ACTION_NAMES[action]:7s} -> "
-                f"term={any(terminations.values())}"
-            )
+            print(f"  step {steps:2d}: belief={sorted(pf.distinct_positions())} "
+                  f"action={ACTION_NAMES[action]:7s} -> term={any(terminations.values())}")
 
         if any(terminations.values()):
             reached_goal = True
@@ -138,48 +135,96 @@ def run_episode(ascii_map, time_budget, seed, max_steps=50, n_particles=300, ver
         if any(truncations.values()) or not env.agents:
             break
 
-        # Read the real observation and correct the belief.
         real_obs = get_agent_observation(env, agent)
-        if not pf.particles:  # defensive: never expected with informative obs
+        if not pf.particles:
             pf.initialize_particles()
-        pf.update(move, real_obs)
+        pf.update(action, real_obs, pre_heading, boxes, planner.sample_step)
 
     return steps, reached_goal
 
 
-def evaluate(time_budget, n_episodes=30, ascii_map=EVAL_MAP, base_seed=0,
+def run_episode_multi(ascii_map, time_budget, seed, max_steps=50, n_particles=500, verbose=False):
+    """One multi-agent (decentralized) online-planning episode -> ``(steps, goal)``."""
+    np.random.seed(seed)
+    env = StochasticMultiAgentBoxPushEnv(ascii_map=ascii_map, max_steps=max_steps)
+    env.reset(seed=seed)
+    agents = list(env.possible_agents)
+
+    pf, planner = {}, {}
+    for i, a in enumerate(agents):
+        pf[a], planner[a] = _make_agent(ascii_map, n_particles, seed + i)
+    heading = {a: env.agent_dirs[a] for a in agents}
+    for a in agents:
+        _localize_initial(pf[a], env, a)
+
+    steps, reached_goal = 0, False
+    while env.agents:
+        current = list(env.agents)
+        actions = {}
+        for a in current:                      # each robot plans independently
+            planner[a].tree.clear()
+            actions[a] = planner[a].search(time_budget, known_dir=heading[a])
+
+        _obs, _r, terminations, truncations, _i = env.step(actions)
+        steps += 1
+        pre_heading = dict(heading)
+        for a in current:
+            heading[a] = next_heading(actions[a], heading[a])
+
+        if verbose:
+            trace = " | ".join(f"{a}:{ACTION_NAMES[actions[a]]}" for a in current)
+            print(f"  step {steps:2d}: {trace} -> term={any(terminations.values())}")
+
+        if any(terminations.values()):
+            reached_goal = True
+            break
+        if any(truncations.values()) or not env.agents:
+            break
+
+        for a in current:
+            real_obs = get_agent_observation(env, a)
+            if not pf[a].particles:
+                pf[a].initialize_particles()
+            pf[a].update(actions[a], real_obs, pre_heading[a],
+                         planner[a].initial_boxes, planner[a].sample_step)
+
+    return steps, reached_goal
+
+
+def evaluate(time_budget, n_episodes=30, scenario="single", base_seed=0,
              max_steps=50, verbose=False):
     """
-    Run ``n_episodes`` independent episodes at a fixed ``time_budget`` per step.
-    Returns a stats dict with success rate and mean/std of steps-to-goal.
+    Run ``n_episodes`` independent episodes of ``scenario`` ("single"/"multi") at
+    a fixed per-step ``time_budget``. Returns a stats dict.
     """
-    steps_per_ep = []
+    ascii_map = MULTI_MAP if scenario == "multi" else SINGLE_MAP
+    runner = run_episode_multi if scenario == "multi" else run_episode
+
+    results = []
     successes = 0
     for ep in range(n_episodes):
-        steps, ok = run_episode(
-            ascii_map, time_budget, seed=base_seed + ep,
-            max_steps=max_steps, verbose=verbose,
-        )
-        steps_per_ep.append((steps, ok))
+        steps, ok = runner(ascii_map, time_budget, seed=base_seed + ep,
+                           max_steps=max_steps, verbose=verbose)
+        results.append((steps, ok))
         successes += int(ok)
         if verbose:
-            print(f"episode {ep:2d}: steps={steps} reached_goal={ok}")
+            print(f"[{scenario}] episode {ep:2d}: steps={steps} reached_goal={ok}")
 
-    solved_steps = np.array([s for s, ok in steps_per_ep if ok], dtype=float)
+    solved = np.array([s for s, ok in results if ok], dtype=float)
     return {
+        "scenario": scenario,
         "time_budget": time_budget,
         "n_episodes": n_episodes,
         "successes": successes,
         "success_rate": successes / n_episodes,
-        "mean_steps": float(solved_steps.mean()) if solved_steps.size else float("nan"),
-        "std_steps": float(solved_steps.std()) if solved_steps.size else float("nan"),
+        "mean_steps": float(solved.mean()) if solved.size else float("nan"),
+        "std_steps": float(solved.std()) if solved.size else float("nan"),
     }
 
 
 def _print_stats(stats):
-    tb = stats["time_budget"]
     print(
-        f"time_budget = {tb:>5.1f}s | "
+        f"{stats['scenario']:6s} | time_budget = {stats['time_budget']:>5.1f}s | "
         f"success {stats['successes']:2d}/{stats['n_episodes']} | "
         f"steps to goal: mean={stats['mean_steps']:5.2f}  std={stats['std_steps']:5.2f}"
     )
@@ -188,25 +233,29 @@ def _print_stats(stats):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate the POMCP box-pushing agent.")
     parser.add_argument("--episodes", type=int, default=30,
-                        help="episodes per configuration (default: 30)")
+                        help="episodes per (scenario, budget) configuration (default: 30)")
     parser.add_argument("--budgets", type=float, nargs="+", default=[1.0, 20.0],
                         help="per-step planning time budgets in seconds (default: 1.0 20.0)")
+    parser.add_argument("--scenarios", nargs="+", default=["single", "multi"],
+                        choices=["single", "multi"],
+                        help="which scenarios to run (default: single multi)")
     parser.add_argument("--max-steps", type=int, default=50,
                         help="max env steps before truncation (default: 50)")
     parser.add_argument("--verbose", action="store_true",
                         help="print a per-step / per-episode trace")
     args = parser.parse_args()
 
-    print(f"=== POMCP evaluation | map {EVAL_MAP} | {args.episodes} episodes/config ===")
-    print("(note: wall-clock cost per config ~= episodes * steps * time_budget;\n"
-          " the 20.0s configuration can take tens of minutes.)\n")
+    print(f"=== POMCP evaluation | {args.episodes} episodes per (scenario, budget) ===")
+    print("(note: wall-clock ~= episodes * steps * budget, x2 agents for 'multi';\n"
+          " the 20.0s configurations can take a long time.)\n")
 
     results = []
-    for tb in args.budgets:
-        stats = evaluate(tb, n_episodes=args.episodes,
-                         max_steps=args.max_steps, verbose=args.verbose)
-        results.append(stats)
-        _print_stats(stats)
+    for scenario in args.scenarios:
+        for tb in args.budgets:
+            stats = evaluate(tb, n_episodes=args.episodes, scenario=scenario,
+                             max_steps=args.max_steps, verbose=args.verbose)
+            results.append(stats)
+            _print_stats(stats)
 
     return results
 
